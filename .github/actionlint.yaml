@@ -3,3 +3,4 @@ self-hosted-runner:
     - f1r3fly-rust-ci-ephemeral
     - f1r3fly-rust-soak
     - oracle-cloud
+    - testbed
