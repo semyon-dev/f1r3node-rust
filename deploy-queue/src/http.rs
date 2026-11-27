@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -51,6 +51,7 @@ pub fn router(state: HttpState) -> Router {
             "/api/deploy-finalization-status/{deploy_sig_hex}",
             get(deploy_status_handler),
         )
+        .route("/api/deploy-finalization-status", post(reconcile_handler))
         .route("/ws/deploys", get(watch_handler))
         .route("/ws/events", get(events_proxy_handler))
         .route("/queue/status", get(queue_status_handler))
@@ -60,12 +61,26 @@ pub fn router(state: HttpState) -> Router {
         .with_state(state)
 }
 
-fn error_response(status: StatusCode, kind: &str, message: String) -> Response {
-    (status, Json(json!({ "error": kind, "message": message }))).into_response()
+fn error_response(
+    status: StatusCode,
+    kind: &str,
+    message: String,
+    cause: Option<&str>,
+) -> Response {
+    let mut body = json!({ "error": kind, "message": message });
+    if let Some(cause) = cause {
+        body["cause"] = json!(cause);
+    }
+    (status, Json(body)).into_response()
 }
 
 fn intake_error_response(error: IntakeError) -> Response {
-    let mut response = error_response(error.status(), error.kind(), error.to_string());
+    let mut response = error_response(
+        error.status(),
+        error.kind(),
+        error.to_string(),
+        error.cause(),
+    );
     if let Some(secs) = error.retry_after_secs() {
         response
             .headers_mut()
@@ -84,6 +99,7 @@ async fn deploy_handler(State(state): State<HttpState>, body: Bytes) -> Response
                 StatusCode::BAD_REQUEST,
                 "invalid_request_body",
                 e.to_string(),
+                None,
             )
         }
     };
@@ -129,8 +145,35 @@ async fn deploy_status_handler(
             StatusCode::BAD_REQUEST,
             "invalid_hash",
             format!("'{}' is not a valid hex deploy signature", deploy_sig_hex),
+            None,
         );
     };
+    status_or_proxy(&state, sig, request).await
+}
+
+async fn reconcile_handler(State(state): State<HttpState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
+        Ok(bytes) => bytes,
+        Err(e) => return error_response(e.status(), "invalid_request_body", e.body_text(), None),
+    };
+    let copy = Request::from_parts(parts.clone(), Body::from(bytes.clone()));
+    let deploy = match Json::<DeployRequest>::from_request(copy, &()).await {
+        Ok(Json(request)) => match request.to_signed() {
+            Ok(deploy) => deploy,
+            Err(e) => return intake_error_response(IntakeError::IllegalArgument(e.to_string())),
+        },
+        Err(e) => return error_response(e.status(), "invalid_request_body", e.body_text(), None),
+    };
+    status_or_proxy(
+        &state,
+        deploy.sig.to_vec(),
+        Request::from_parts(parts, Body::from(bytes)),
+    )
+    .await
+}
+
+async fn status_or_proxy(state: &HttpState, sig: Sig, request: Request) -> Response {
     match state.engine.status(sig).await {
         Ok(Some(view)) => Json(QueueDeployStatus::from(view)).into_response(),
         Ok(None) => proxy(&state.node, request).await,
@@ -138,6 +181,7 @@ async fn deploy_status_handler(
             StatusCode::SERVICE_UNAVAILABLE,
             "deploy_queue_stopped",
             e.to_string(),
+            None,
         ),
     }
 }
@@ -168,6 +212,7 @@ async fn watch_handler(
                 StatusCode::BAD_REQUEST,
                 "invalid_hash",
                 "sigs must be a comma-separated list of hex deploy signatures".to_string(),
+                None,
             )
         }
     };
@@ -290,6 +335,7 @@ async fn queue_status_handler(State(state): State<HttpState>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "deploy_queue_stopped",
             e.to_string(),
+            None,
         ),
     }
 }
@@ -341,6 +387,7 @@ async fn proxy(node: &NodeHttp, request: Request) -> Response {
                         StatusCode::BAD_GATEWAY,
                         "node_unavailable",
                         format!("node answer could not be relayed: {}", e),
+                        None,
                     )
                 })
         }
@@ -348,6 +395,7 @@ async fn proxy(node: &NodeHttp, request: Request) -> Response {
             StatusCode::BAD_GATEWAY,
             "node_unavailable",
             format!("node did not answer: {}", e),
+            None,
         ),
     }
 }

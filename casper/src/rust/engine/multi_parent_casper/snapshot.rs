@@ -22,6 +22,7 @@ use shared::rust::store::key_value_store::KvStoreError;
 use super::types::MultiParentCasperImpl;
 use crate::rust::casper::{CasperSnapshot, OnChainCasperState};
 use crate::rust::errors::CasperError;
+use crate::rust::finality::floor::{active_latest_messages, Floor};
 use crate::rust::metrics_constants::{
     ACTIVE_VALIDATORS_CACHE_SIZE_METRIC, CASPER_METRICS_SOURCE, DAG_BLOCKS_SIZE_METRIC,
     DAG_CHILDREN_INDEX_SIZE_METRIC, DAG_FINALIZED_BLOCKS_SIZE_METRIC, DAG_HEIGHTS_SIZE_METRIC,
@@ -111,6 +112,72 @@ pub(crate) fn record_dag_cardinality_metrics(dag: &KeyValueDagRepresentation) {
         .set(dag.resident_counts().finalized as f64);
 }
 
+async fn remove_retired_parent_candidates(
+    this: &MultiParentCasperImpl,
+    dag: &KeyValueDagRepresentation,
+    latest_metas: &HashMap<Validator, BlockMetadata>,
+    candidates: &mut HashMap<Validator, BlockHash>,
+) -> Result<(), CasperError> {
+    if !latest_metas.values().any(|meta| meta.finalized) {
+        return Ok(());
+    }
+    let Some(hash) = dag.get_cached_floor(&dag.last_finalized_block())? else {
+        return Ok(());
+    };
+    let block_number = dag.block_number_unsafe(&hash)?;
+    let is_below_finalized_floor =
+        |meta: &BlockMetadata| meta.finalized && meta.block_number < block_number;
+    if !latest_metas.values().any(is_below_finalized_floor) {
+        return Ok(());
+    }
+
+    let active = active_latest_messages(dag, &this.block_store, &this.runtime_manager, &Floor {
+        hash: hash.clone(),
+        block_number,
+    })
+    .await?;
+    let conf = &this.casper_shard_conf;
+    let retention_depth = i64::from(conf.max_parent_depth)
+        + i64::from(conf.mergeable_channels_gc_depth_buffer)
+        + conf.deploy_lifespan;
+    for (validator, meta) in latest_metas {
+        if !is_below_finalized_floor(meta) {
+            continue;
+        }
+        let retired = !active.contains_key(validator);
+        let old_enough = block_number.saturating_sub(meta.block_number) > retention_depth;
+        if retired || (old_enough && left_committee_after(dag, &hash, meta)?) {
+            candidates.remove(validator);
+        }
+    }
+    Ok(())
+}
+
+fn left_committee_after(
+    dag: &KeyValueDagRepresentation,
+    finalized_floor: &BlockHash,
+    latest: &BlockMetadata,
+) -> Result<bool, KvStoreError> {
+    let mut cursor = Some(finalized_floor.clone());
+    while let Some(hash) = cursor {
+        let Some(block) = dag.lookup(&hash)? else {
+            break;
+        };
+        if block.block_number <= latest.block_number {
+            break;
+        }
+        if !block.weight_map.contains_key(&latest.sender) {
+            if let Some(floor) = dag.get_cached_floor(&hash)? {
+                if dag.block_number_unsafe(&floor)? > latest.block_number {
+                    return Ok(true);
+                }
+            }
+        }
+        cursor = block.parents.first().cloned();
+    }
+    Ok(false)
+}
+
 pub(crate) async fn compute_snapshot(
     this: &MultiParentCasperImpl,
 ) -> Result<CasperSnapshot, CasperError> {
@@ -161,6 +228,8 @@ pub(crate) async fn compute_snapshot(
     for validator in unheld_validators {
         valid_latest_msgs.remove(&validator);
     }
+    remove_retired_parent_candidates(this, &dag, &valid_latest_metas, &mut valid_latest_msgs)
+        .await?;
     let mut unique_parent_hashes: HashSet<BlockHash> =
         HashSet::with_capacity(valid_latest_msgs.len());
     for hash in valid_latest_msgs.values() {
@@ -514,16 +583,16 @@ pub(crate) async fn compute_snapshot(
                 )?;
 
                 for block_hash in traversal_result {
-                    let block_deploys = this
+                    let scope = this
                         .block_store
-                        .deploy_identities(&block_hash)?
+                        .deploys_for_scope(&block_hash)?
                         .ok_or_else(|| {
                             CasperError::RuntimeError(format!(
                                 "Missing block {} during deploys_in_scope traversal",
                                 PrettyPrinter::build_string_bytes(&block_hash)
                             ))
                         })?;
-                    for identity in block_deploys.iter() {
+                    for identity in scope.identities.iter() {
                         let deploy_sig: Bytes = identity.sig.clone().into();
                         let mut holders = all_seeds
                             .entry(identity.seed.clone())
@@ -539,11 +608,9 @@ pub(crate) async fn compute_snapshot(
                     // rejected_in_scope set. The block creator and validator
                     // intersect this with deploys_in_scope to decide
                     // re-inclusion eligibility for merge-rejected deploys.
-                    if let Some(rejected_sigs) =
-                        this.block_store.rejected_deploy_sigs(&block_hash)?
-                    {
-                        for sig in rejected_sigs {
-                            all_rejected.insert(sig.into());
+                    if let Some(rejected) = scope.rejected {
+                        for sig in rejected.iter() {
+                            all_rejected.insert(sig.clone().into());
                         }
                     }
                 }

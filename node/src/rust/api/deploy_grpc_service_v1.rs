@@ -7,8 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use block_storage::rust::key_value_block_store::KeyValueBlockStore;
-use casper::rust::api::block_api::{BlockAPI, BlocksByHeightsResponse, ExploratoryDeployRejection};
+use casper::rust::api::block_api::{
+    BlockAPI, BlocksByHeightsResponse, ExploratoryDeployRejection, PrunedStateError,
+};
 use casper::rust::api::block_report_api::BlockReportAPI;
+use casper::rust::api::deploy_reconciliation::ReconciledStatus;
 use casper::rust::api::graph_generator::{GraphConfig, GraphzGenerator};
 use casper::rust::casper::DeployError;
 use casper::rust::engine::engine_cell::EngineCell;
@@ -23,7 +26,8 @@ use models::casper::v1::{
     ContinuationAtNameResponse, DeployFinalizationStatusResponse, DeployResponse,
     EventInfoResponse, ExploratoryDeployResponse, FindDeployResponse, IsFinalizedResponse,
     LastFinalizedBlockResponse, MachineVerifyResponse, PendingDeploysResponse,
-    PrivateNamePreviewResponse, RhoDataResponse, StatusResponse, VisualizeBlocksResponse,
+    PrivateNamePreviewResponse, PrunedStateInfo, RhoDataResponse, StatusResponse,
+    VisualizeBlocksResponse,
 };
 use models::casper::{
     BlockQuery, BlocksQuery, BlocksQueryByHeight, BondStatusQuery, ContinuationAtNameQuery,
@@ -62,6 +66,19 @@ impl IntoServiceError for casper::rust::api::block_report_api::BlockReportError 
 
 const FIND_DEPLOY_RETRY_INTERVAL_MS: u64 = 100;
 const FIND_DEPLOY_MAX_ATTEMPTS: u8 = 80;
+
+/// Issue #1157: extract a [`PrunedStateError`] from an `eyre` chain so the
+/// gRPC handler can map it to the `pruned` oneof arm instead of folding
+/// its data into a prose `ServiceError.messages`.
+fn classify_pruned_state(err: &eyre::Error) -> Option<PrunedStateInfo> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<PrunedStateError>())
+        .map(|p| PrunedStateInfo {
+            target_block_hash: p.target_block_hash.clone(),
+            target_block_height: p.target_block_height,
+            retention_floor: p.retention_floor,
+        })
+}
 
 /// Flatten a [`BlocksByHeightsResponse`] into the ordered sequence of
 /// `BlockInfoResponse` items the `getBlocksByHeights` stream emits:
@@ -144,6 +161,27 @@ pub struct DeployGrpcServiceV1Impl {
 }
 
 impl DeployGrpcServiceV1Impl {
+    async fn reconcile_deploy(
+        &self,
+        sig: prost::bytes::Bytes,
+        proto: DeployDataProto,
+    ) -> eyre::Result<ReconciledStatus> {
+        let permit = self.deploy_limiter.try_acquire()?;
+        let engine = self.engine_cell.clone();
+        let shard = self.shard_id.clone();
+        crate::rust::web::shared_handlers::offload(move || async move {
+            let _permit = permit;
+            let deploy =
+                models::rust::casper::protocol::casper_message::DeployData::from_proto(proto)
+                    .map_err(
+                        |message| casper::rust::api::block_api::DeployValidationError { message },
+                    )?;
+            BlockAPI::deploy_finalization_status_reconciled(&engine, &sig, Some(&deploy), &shard)
+                .await
+        })
+        .await
+    }
+
     pub fn new(
         api_max_blocks_limit: i32,
         trigger_propose_f: Option<Arc<ProposeFunction>>,
@@ -611,6 +649,15 @@ impl DeployService for DeployGrpcServiceV1Impl {
             }
             Err(e) => {
                 error!("Deploy service method error get_data_at_name: {}", e);
+                // Issue #1157: a pruned-state refusal takes the `pruned`
+                // oneof arm so the caller can route to an archive node.
+                if let Some(pruned) = classify_pruned_state(&e) {
+                    return Ok(tonic::Response::new(RhoDataResponse {
+                        message: Some(models::casper::v1::rho_data_response::Message::Pruned(
+                            pruned,
+                        )),
+                    }));
+                }
                 Ok(tonic::Response::new(RhoDataResponse {
                     message: Some(models::casper::v1::rho_data_response::Message::Error(
                         e.into_service_error(),
@@ -844,25 +891,31 @@ impl DeployService for DeployGrpcServiceV1Impl {
         }
     }
 
-    /// Query the finalization status of a deploy by its signature.
+    /// Query the finalization status of a deploy by its signature. When the
+    /// query carries the saved signed deploy (#1103), a sig the register has
+    /// never observed is reconciled against the floor of the adopted last
+    /// finalized block; the response names that basis.
     async fn deploy_finalization_status(
         &self,
         request: tonic::Request<DeployFinalizationStatusQuery>,
     ) -> Result<tonic::Response<DeployFinalizationStatusResponse>, tonic::Status> {
         let request = request.into_inner();
-        match casper::rust::api::block_api::BlockAPI::deploy_finalization_status(
-            &self.engine_cell,
-            &request.deploy_sig,
-        )
-        .await
-        {
-            Ok(status) => Ok(tonic::Response::new(DeployFinalizationStatusResponse {
+        let verdict = match request.deploy {
+            Some(proto) => self.reconcile_deploy(request.deploy_sig, proto).await,
+            None => BlockAPI::deploy_finalization_status(&self.engine_cell, &request.deploy_sig)
+                .await
+                .map(ReconciledStatus::from_lookup),
+        };
+        match verdict {
+            Ok(reconciled) => Ok(tonic::Response::new(DeployFinalizationStatusResponse {
                 message: Some(
                     models::casper::v1::deploy_finalization_status_response::Message::Status(
                         DeployFinalizationStatusInfo {
-                            state: deploy_state_to_proto(status.state) as i32,
-                            rejection_count: status.rejection_count,
-                            latest_block_hash: status.latest_block_hash,
+                            state: deploy_state_to_proto(reconciled.status.state) as i32,
+                            rejection_count: reconciled.status.rejection_count,
+                            latest_block_hash: reconciled.status.latest_block_hash,
+                            basis_block_hash: reconciled.basis.as_ref().map(|f| f.hash.clone()),
+                            basis_block_height: reconciled.basis.as_ref().map(|f| f.block_number),
                         },
                     ),
                 ),
@@ -1022,6 +1075,19 @@ impl DeployService for DeployGrpcServiceV1Impl {
                         }
                     });
                 }
+                // Issue #1157: a pruned-state refusal takes the typed
+                // `pruned` oneof arm so the client sees the retention
+                // floor and target height without parsing prose.
+                if let Some(pruned) = classify_pruned_state(&e) {
+                    return Ok(tonic::Response::new(ExploratoryDeployResponse {
+                        message: Some(
+                            models::casper::v1::exploratory_deploy_response::Message::Pruned(
+                                pruned,
+                            ),
+                        ),
+                        cost: 0,
+                    }));
+                }
                 Ok(tonic::Response::new(ExploratoryDeployResponse {
                     message: Some(
                         models::casper::v1::exploratory_deploy_response::Message::Error(
@@ -1068,6 +1134,24 @@ impl DeployService for DeployGrpcServiceV1Impl {
             })),
             Err(e) => {
                 error!("Deploy service method error get_event_by_hash: {}", e);
+                // Issue #1157: a pruned-state refusal from the block-report
+                // replay path takes the typed `pruned` oneof arm.
+                if let casper::rust::api::block_report_api::BlockReportError::PrunedState {
+                    target_block_hash,
+                    target_block_height,
+                    retention_floor,
+                } = &e
+                {
+                    return Ok(tonic::Response::new(EventInfoResponse {
+                        message: Some(models::casper::v1::event_info_response::Message::Pruned(
+                            PrunedStateInfo {
+                                target_block_hash: target_block_hash.clone(),
+                                target_block_height: *target_block_height,
+                                retention_floor: *retention_floor,
+                            },
+                        )),
+                    }));
+                }
                 Ok(tonic::Response::new(EventInfoResponse {
                     message: Some(models::casper::v1::event_info_response::Message::Error(
                         e.into_service_error(),
@@ -1904,11 +1988,27 @@ mod tests {
         let finalization = service
             .deploy_finalization_status(tonic::Request::new(DeployFinalizationStatusQuery {
                 deploy_sig: vec![1u8, 2].into(),
+                deploy: None,
             }))
             .await
             .unwrap();
         assert!(matches!(
             finalization.into_inner().message.unwrap(),
+            models::casper::v1::deploy_finalization_status_response::Message::Error(_)
+        ));
+
+        // A query carrying a saved signed deploy (#1103) answers the same
+        // ServiceError before any reconciliation can run: the decode fails
+        // on the unsigned default proto.
+        let reconciled = service
+            .deploy_finalization_status(tonic::Request::new(DeployFinalizationStatusQuery {
+                deploy_sig: vec![1u8, 2].into(),
+                deploy: Some(DeployDataProto::default()),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            reconciled.into_inner().message.unwrap(),
             models::casper::v1::deploy_finalization_status_response::Message::Error(_)
         ));
 
@@ -2152,5 +2252,36 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// Issue #1157: the classifier pulls a `PrunedStateError` out of an
+    /// `eyre` chain even when wrapped — a reader that `.map_err`s or
+    /// `.wrap_err`s the typed refusal must not lose the `pruned` oneof
+    /// routing. The field data (`target_block_height`, `retention_floor`)
+    /// must survive the conversion: those are the values a client parses
+    /// off the response to decide whether to try an archive node.
+    #[test]
+    fn classify_pruned_state_extracts_fields_through_eyre_wrap() {
+        let target = prost::bytes::Bytes::from_static(b"target-block-hash-01234567890abcde");
+        let raw = eyre::Report::new(PrunedStateError {
+            target_block_hash: target.clone(),
+            target_block_height: 42,
+            retention_floor: 90,
+        });
+        let wrapped = raw.wrap_err("while serving exploratory deploy");
+
+        let info = classify_pruned_state(&wrapped).expect("must detect PrunedStateError");
+        assert_eq!(info.target_block_hash, target);
+        assert_eq!(info.target_block_height, 42);
+        assert_eq!(info.retention_floor, 90);
+    }
+
+    /// A non-pruned error must not be misclassified: the classifier must
+    /// walk the chain and return `None` so the generic `error` oneof arm
+    /// still fires. Otherwise every reader failure would read as "pruned".
+    #[test]
+    fn classify_pruned_state_returns_none_for_unrelated_errors() {
+        let unrelated = eyre::eyre!("not a retention event");
+        assert!(classify_pruned_state(&unrelated).is_none());
     }
 }

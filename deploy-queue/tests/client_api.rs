@@ -112,6 +112,39 @@ async fn http_intake_reports_the_queue_state_beside_the_node_status() {
     assert_eq!(status["state"], "Pending");
     assert_eq!(status["queue_state"], "submitted");
 
+    let reconcile = |data: String| {
+        reqwest::Client::new()
+            .post(format!("{}/api/deploy-finalization-status", served.http))
+            .header("content-type", "application/json")
+            .body(data)
+            .send()
+    };
+    let queued: Value = reconcile(request_body(&held))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queued["queue_state"], "submitted");
+    let mut tampered = DeployRequest::from_signed(&held);
+    tampered.data.valid_after_block_number += 1;
+    assert_eq!(
+        reconcile(serde_json::to_string(&tampered).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let expected = json!({"state":"Expired","basisBlockHash":"ab","basisBlockHeight":9});
+    let unknown = deploy(0, "root", 3);
+    let forwarded: Value = reconcile(request_body(&unknown))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(forwarded, expected);
+
     let (code, snapshot) = get_json(format!("{}/queue/status", served.http)).await;
     assert_eq!(code, 200);
     assert_eq!(snapshot["connected"], true);
@@ -147,29 +180,40 @@ async fn http_refusals_keep_the_node_error_envelope() {
             code,
             body["error"].as_str().unwrap().to_string(),
             retry_after,
+            body.get("cause")
+                .map(|cause| cause.as_str().unwrap().to_string()),
         )
     };
 
-    let (code, kind, _) = refusal(post_deploy(&served, "{".to_string()).await).await;
+    let (code, kind, _, cause) = refusal(post_deploy(&served, "{".to_string()).await).await;
     assert_eq!(
-        (code.as_u16(), kind.as_str()),
-        (400, "invalid_request_body")
+        (code.as_u16(), kind.as_str(), cause),
+        (400, "invalid_request_body", None)
     );
 
     let other_shard = request_body(&deploy(90, "other", 3));
-    let (code, kind, _) = refusal(post_deploy(&served, other_shard).await).await;
-    assert_eq!((code.as_u16(), kind.as_str()), (400, "illegal_argument"));
+    let (code, kind, _, cause) = refusal(post_deploy(&served, other_shard).await).await;
+    assert_eq!(
+        (code.as_u16(), kind.as_str(), cause),
+        (400, "illegal_argument", None)
+    );
 
     let held = request_body(&deploy(95, "root", 5));
     assert_eq!(post_deploy(&served, held.clone()).await.status(), 200);
-    let (code, kind, _) = refusal(post_deploy(&served, held).await).await;
-    assert_eq!((code.as_u16(), kind.as_str()), (409, "duplicate_deploy"));
+    let (code, kind, _, cause) = refusal(post_deploy(&served, held).await).await;
+    assert_eq!(
+        (code.as_u16(), kind.as_str(), cause),
+        (409, "duplicate_deploy", None)
+    );
 
     // Open through block 109 at lifespan 50, but landing from tip 100 needs a
     // height of inclusion plus the 25-height margin.
     let too_late = request_body(&deploy(60, "root", 6));
-    let (code, kind, retry_after) = refusal(post_deploy(&served, too_late).await).await;
-    assert_eq!((code.as_u16(), kind.as_str()), (503, "deploy_queue_full"));
+    let (code, kind, retry_after, cause) = refusal(post_deploy(&served, too_late).await).await;
+    assert_eq!(
+        (code.as_u16(), kind.as_str(), cause.as_deref()),
+        (503, "deploy_queue_full", Some("validator"))
+    );
     assert!(retry_after.unwrap().parse::<u64>().is_ok());
     queue.stop();
 }
@@ -330,6 +374,7 @@ async fn grpc_intake_answers_as_the_node_does() {
         .await
         .unwrap_err();
     assert_eq!(full.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(full.metadata().get("cause").unwrap(), "validator");
     assert!(full
         .metadata()
         .get("retry-after")
@@ -342,6 +387,7 @@ async fn grpc_intake_answers_as_the_node_does() {
     let status = client
         .deploy_finalization_status(DeployFinalizationStatusQuery {
             deploy_sig: held.sig.clone(),
+            deploy: None,
         })
         .await
         .unwrap()
@@ -353,6 +399,22 @@ async fn grpc_intake_answers_as_the_node_does() {
         info.state,
         DeployFinalizationStateProto::DeployStatePending as i32
     );
+    let mut tampered = DeployData::to_proto_ref(&held);
+    tampered.valid_after_block_number += 1;
+    for invalid in [tampered, DeployData::to_proto_ref(&deploy(95, "root", 9))] {
+        let response = client
+            .deploy_finalization_status(DeployFinalizationStatusQuery {
+                deploy_sig: held.sig.clone(),
+                deploy: Some(invalid),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            response.message,
+            Some(deploy_finalization_status_response::Message::Error(_))
+        ));
+    }
     queue.stop();
 }
 
